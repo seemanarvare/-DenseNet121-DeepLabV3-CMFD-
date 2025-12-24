@@ -1,0 +1,66 @@
+import os
+import cv2
+import numpy as np
+from tensorflow.keras.applications.densenet import DenseNet121, preprocess_input
+
+def extract_features(image_dir, feature_dir, batch_size=4):
+    """
+    Extract DenseNet121 features from images and save them as _features.npy files.
+
+    Args:
+        image_dir (str): Folder containing input images.
+        feature_dir (str): Folder to save extracted features.
+        batch_size (int): Number of images processed at once.
+    """
+    os.makedirs(feature_dir, exist_ok=True)
+
+    # Load DenseNet121 model without top classification layer
+    base_model = DenseNet121(include_top=False, weights='imagenet', input_shape=(224, 224, 3))
+
+    # Supported image extensions
+    valid_extensions = ['.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff']
+
+    # List of image filenames
+    image_files = [f for f in os.listdir(image_dir) if any(f.lower().endswith(ext) for ext in valid_extensions)]
+
+    print(f"Found {len(image_files)} images in '{image_dir}' for feature extraction.")
+
+    for i in range(0, len(image_files), batch_size):
+        batch_files = image_files[i:i + batch_size]
+        batch_images = []
+        batch_names = []
+
+        for filename in batch_files:
+            image_path = os.path.join(image_dir, filename)
+            image = cv2.imread(image_path)
+            if image is None:
+                print(f"Warning: Failed to load image: {filename}")
+                continue
+
+            # Convert BGR to RGB and resize
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            image = cv2.resize(image, (224, 224), interpolation=cv2.INTER_AREA)
+            image = preprocess_input(image)  # Apply ImageNet preprocessing
+            batch_images.append(image)
+            batch_names.append(os.path.splitext(filename)[0])
+
+        if not batch_images:
+            continue
+
+        batch_images = np.array(batch_images)
+
+        # Extract features
+        features = base_model.predict(batch_images, verbose=0)
+
+        # Save each feature as .npy file
+        for j, name in enumerate(batch_names):
+            feature_path = os.path.join(feature_dir, f"{name}_features.npy")
+            np.save(feature_path, features[j])
+            print(f"Saved: {feature_path}")
+
+    print("✅ Feature extraction complete.")
+
+# 🟢 Run this block to start feature extraction
+image_dir = r"D:\image"
+feature_dir = r"D:\feature"
+extract_features(image_dir, feature_dir, batch_size=4)
