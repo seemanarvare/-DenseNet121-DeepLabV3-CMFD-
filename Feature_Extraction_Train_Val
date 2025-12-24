@@ -1,0 +1,200 @@
+import os
+import glob
+import time
+import logging
+import numpy as np
+import tensorflow as tf
+import cv2
+
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.applications.densenet import preprocess_input
+
+# ------------------------------------------------------------------
+# Logging configuration
+# ------------------------------------------------------------------
+logging.basicConfig(
+    filename='feature_extraction.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------------
+# Reproducibility
+# ------------------------------------------------------------------
+tf.random.set_seed(42)
+np.random.seed(42)
+
+# ------------------------------------------------------------------
+# GPU configuration
+# ------------------------------------------------------------------
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    logger.info("GPU memory growth enabled.")
+else:
+    logger.info("Running on CPU.")
+
+# ------------------------------------------------------------------
+# Dataset paths (Training & Validation only)
+# ------------------------------------------------------------------
+train_image_dirs = [
+    r"C:\split_dataset\train\image"
+]
+train_mask_dirs = [
+    r"C:\split_dataset\train\mask"
+]
+
+val_image_dirs = [
+    r"C:\split_dataset\val\image"
+]
+val_mask_dirs = [
+    r"C:\split_dataset\val\mask"
+]
+
+train_feature_dir = r"C:\TRAIN_FEATURES"
+val_feature_dir   = r"C:\VAL_FEATURES"
+
+os.makedirs(train_feature_dir, exist_ok=True)
+os.makedirs(val_feature_dir, exist_ok=True)
+
+# ------------------------------------------------------------------
+# Mask processing
+# ------------------------------------------------------------------
+def process_mask(mask_path):
+    """
+    Load and process ground-truth mask.
+    Output shape: (224, 224, 1), binary format.
+    """
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise ValueError("Mask could not be loaded")
+
+    mask = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
+    mask = (mask > 127).astype(np.float32)
+    mask = mask[:, :, np.newaxis]
+
+    return mask
+
+# ------------------------------------------------------------------
+# Feature extraction function
+# ------------------------------------------------------------------
+def extract_features(image_dirs, mask_dirs, output_dir, dataset_type, batch_size=32):
+
+    logger.info(f"Starting feature extraction for {dataset_type} set")
+
+    # DenseNet121 backbone
+    backbone = DenseNet121(
+        include_top=False,
+        weights='imagenet',
+        input_shape=(224, 224, 3)
+    )
+
+    # Intermediate feature map extraction
+    feature_model = tf.keras.Model(
+        inputs=backbone.input,
+        outputs=backbone.get_layer('relu').output
+    )
+
+    # Collect image files
+    image_files = []
+    for img_dir in image_dirs:
+        for ext in ['*.jpg', '*.png', '*.bmp', '*.tif', '*.tiff']:
+            image_files.extend(glob.glob(os.path.join(img_dir, ext)))
+    image_files = sorted(image_files)
+
+    if len(image_files) == 0:
+        raise RuntimeError("No images found for feature extraction")
+
+    processed = 0
+    skipped = 0
+    start_time = time.time()
+
+    for i in range(0, len(image_files), batch_size):
+        batch_paths = image_files[i:i + batch_size]
+
+        images = []
+        filenames = []
+        mask_paths = []
+
+        for img_path in batch_paths:
+            try:
+                img = load_img(img_path, target_size=(224, 224))
+                img_array = img_to_array(img)
+
+                filename = os.path.splitext(os.path.basename(img_path))[0]
+
+                # Locate corresponding mask
+                mask_path = None
+                for mdir in mask_dirs:
+                    for ext in ['png', 'jpg', 'bmp', 'tif']:
+                        candidate = os.path.join(mdir, f"{filename}_mask.{ext}")
+                        if os.path.exists(candidate):
+                            mask_path = candidate
+                            break
+                        candidate = os.path.join(mdir, f"{filename}_gt.{ext}")
+                        if os.path.exists(candidate):
+                            mask_path = candidate
+                            break
+                    if mask_path:
+                        break
+
+                # If mask not found, assign blank mask (authentic image)
+                if mask_path is None:
+                    mask = np.zeros((224, 224, 1), dtype=np.float32)
+                else:
+                    mask = process_mask(mask_path)
+
+                images.append(img_array)
+                filenames.append(filename)
+                mask_paths.append(mask)
+
+            except Exception as e:
+                logger.warning(f"Skipping image {img_path}: {str(e)}")
+                skipped += 1
+
+        if len(images) == 0:
+            continue
+
+        images = preprocess_input(np.array(images))
+
+        features = feature_model.predict(images, verbose=0)
+
+        for j, fname in enumerate(filenames):
+            np.save(os.path.join(output_dir, f"{fname}_features.npy"), features[j])
+            np.save(os.path.join(output_dir, f"{fname}_mask.npy"), mask_paths[j])
+            processed += 1
+
+        elapsed = time.time() - start_time
+        logger.info(f"{dataset_type}: {processed} processed, {skipped} skipped, time {elapsed:.2f}s")
+
+    logger.info(f"Completed {dataset_type} feature extraction")
+
+# ------------------------------------------------------------------
+# Main execution
+# ------------------------------------------------------------------
+def main():
+
+    # Clear old feature files
+    for out_dir in [train_feature_dir, val_feature_dir]:
+        for f in glob.glob(os.path.join(out_dir, "*.npy")):
+            os.remove(f)
+
+    extract_features(
+        image_dirs=train_image_dirs,
+        mask_dirs=train_mask_dirs,
+        output_dir=train_feature_dir,
+        dataset_type='train'
+    )
+
+    extract_features(
+        image_dirs=val_image_dirs,
+        mask_dirs=val_mask_dirs,
+        output_dir=val_feature_dir,
+        dataset_type='validation'
+    )
+
+if __name__ == "__main__":
+    main()
