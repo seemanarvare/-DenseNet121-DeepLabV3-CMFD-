@@ -17,4 +17,6 @@ paper-[D. Cozzolino, G. Poggi, and L. Verdoliva, “Efficient Dense-Field Copy-M
 👉 https://lci.micc.unifi.it/labd/2015/01/copy-move-forgery-detection-and-localization/
 # Defacto
 👉 https://defactodataset.github.io
+# CASIA-CMFD (derived from CASIA Version2)
+👉 https://www.kaggle.com/datasets/divg07/casia-20-image-tampering-detection-dataset
 # Data Availability Note: Processed versions will be provided upon request to the corresponding author (email: [seemanarvare@gmail.com]).
