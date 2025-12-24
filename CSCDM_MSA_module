@@ -1,4 +1,4 @@
-# _cscdm_spectral_model.py
+# _cscdm_spectral_
 import os
 import cv2
 import numpy as np
@@ -448,13 +448,13 @@ def visualize_and_compute_metrics(model, feature_dir, image_dir, mask_dir, outpu
 # ---------------- main ----------------
 def main():
     # ==== Update these paths to your environment ====
-    train_feature_dir = r"/home/kunj.bihari/SEEMA/16_10_2025_Super_computer_data/train/TRAIN_FEATURES"
-    val_feature_dir = r"/home/kunj.bihari/SEEMA/16_10_2025_Super_computer_data/val/VAL_FEATURES"
-    test_feature_dir = r"/home/kunj.bihari/SEEMA/CoMoFoD_5000_SuperComputer/feature_extraction"
-    test_image_dir = r"/home/kunj.bihari/SEEMA/16_10_2025_Super_computer_data/Test_5000_images"
-    test_mask_dir = r"/home/kunj.bihari/SEEMA/CoMoFoD_5000_SuperComputer/GT_mask"
-    weights_path = r"/home/kunj.bihari/SEEMA/Copy_Move/Ablation_1/deeplabv3_cscdm_spectral.weights.h5"
-    output_dir = r"/home/kunj.bihari/SEEMA/Copy_Move/Ablation_1/output_spectral"
+    train_feature_dir = r"/train/TRAIN_FEATURES"
+    val_feature_dir = r"/val/VAL_FEATURES"
+    test_feature_dir = r"/feature_extraction"
+    test_image_dir = r"/Test_images"
+    test_mask_dir = r"/GT_mask"
+    weights_path = r"/deeplabv3_cscdm_spectral.weights.h5"
+    output_dir = r"/output_spectral"
     batch_size = 4
     epochs = 100
 
