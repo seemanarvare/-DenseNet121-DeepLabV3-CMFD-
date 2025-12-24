@@ -1,0 +1,309 @@
+# test_full_spectral_model.py
+import os
+import sys
+import gc
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, Model, backend as K
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.metrics import precision_score, recall_score, accuracy_score, confusion_matrix, matthews_corrcoef
+
+# ---------------- GPU (optional) ----------------
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for g in gpus:
+            tf.config.experimental.set_memory_growth(g, True)
+    except Exception:
+        pass
+
+# ---------------- Utilities / Metrics ----------------
+def compute_metrics_np(y_true, y_pred):
+    # y_true, y_pred are numpy arrays with shapes (H,W,1)
+    y_true = (y_true > 0.5).astype(np.uint8).flatten()
+    y_pred = (y_pred > 0.5).astype(np.uint8).flatten()
+    eps = 1e-7
+    TP = int(np.sum((y_true == 1) & (y_pred == 1)))
+    FP = int(np.sum((y_true == 0) & (y_pred == 1)))
+    FN = int(np.sum((y_true == 1) & (y_pred == 0)))
+    TN = int(np.sum((y_true == 0) & (y_pred == 0)))
+    precision = TP / (TP + FP + eps)
+    recall = TP / (TP + FN + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    iou = TP / (TP + FP + FN + eps)
+    accuracy = (TP + TN) / (TP + TN + FP + FN + eps)
+    try:
+        mcc = matthews_corrcoef(y_true, y_pred)
+    except Exception:
+        mcc = 0.0
+    return {"IoU": float(iou), "F1": float(f1), "Precision": float(precision),
+            "Recall": float(recall), "Accuracy": float(accuracy),
+            "TP": TP, "FP": FP, "FN": FN, "TN": TN, "MCC": float(mcc)}
+
+# ---------------- Loss components (kept for completeness) ----------------
+def edge_loss(y_true, y_pred):
+    st = tf.image.sobel_edges(y_true)
+    sp = tf.image.sobel_edges(y_pred)
+    st = tf.reduce_mean(tf.abs(st), axis=-1, keepdims=True)
+    sp = tf.reduce_mean(tf.abs(sp), axis=-1, keepdims=True)
+    return tf.reduce_mean(tf.abs(st - sp))
+
+def focal_loss_binary(y_true, y_pred, alpha=0.25, gamma=2.0):
+    eps = 1e-7
+    y_pred = tf.clip_by_value(y_pred, eps, 1-eps)
+    pt = tf.where(tf.equal(y_true, 1.0), y_pred, 1.0 - y_pred)
+    return tf.reduce_mean(-alpha * tf.pow(1.0 - pt, gamma) * tf.math.log(pt))
+
+def custom_loss(y_true, y_pred):
+    y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0-1e-7)
+    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+    bce = tf.reduce_mean(bce)
+    inter = 2.0 * tf.reduce_sum(y_true * y_pred) + 1e-7
+    union = tf.reduce_sum(y_true) + tf.reduce_sum(y_pred) + 1e-7
+    dice = 1.0 - (inter / union)
+    return bce + dice + 0.4 * edge_loss(y_true, y_pred) + 0.5 * focal_loss_binary(y_true, y_pred)
+
+# ---------------- FFT log mag layer ----------------
+def fft_log_mag_layer():
+    def _fn(x):
+        # x: (B,H,W,C)
+        x = tf.cast(x, tf.float32)
+        x_perm = tf.transpose(x, [0, 3, 1, 2])  # (B,C,H,W)
+        fft = tf.signal.fft2d(tf.complex(x_perm, 0.0))
+        mag = tf.abs(fft)  # (B,C,H,W)
+        mag = tf.transpose(mag, [0, 2, 3, 1])  # (B,H,W,C)
+        mag = tf.math.log1p(mag)
+        denom = tf.reduce_max(mag, axis=[1,2,3], keepdims=True) + 1e-6
+        mag = mag / denom
+        return tf.cast(mag, tf.float32)
+    return layers.Lambda(lambda z: _fn(z), dtype=tf.float32, name="fft_log_mag")
+
+# ---------------- Frequency attention block ----------------
+def frequency_attention_block(x, out_channels=256, scales=(1,2)):
+    H = tf.shape(x)[1]; W = tf.shape(x)[2]
+    spectral_feats = []
+    fft_layer = fft_log_mag_layer()
+    for s in scales:
+        target_h = tf.cast(tf.cast(H, tf.float32) * tf.cast(s, tf.float32), tf.int32)
+        target_w = tf.cast(tf.cast(W, tf.float32) * tf.cast(s, tf.float32), tf.int32)
+        resized = tf.image.resize(x, size=(target_h, target_w), method='bilinear')
+        mag = fft_layer(resized)
+        f = layers.Conv2D(out_channels//4, 1, activation='relu', padding='same')(mag)
+        f = layers.BatchNormalization()(f)
+        f = layers.Conv2D(out_channels//4, 3, activation='relu', padding='same')(f)
+        f = layers.BatchNormalization()(f)
+        f = tf.image.resize(f, size=(H, W), method='bilinear')
+        spectral_feats.append(f)
+    if len(spectral_feats) > 1:
+        fused = layers.Concatenate()(spectral_feats)
+    else:
+        fused = spectral_feats[0]
+    fused = layers.Conv2D(out_channels, 1, activation='relu', padding='same')(fused)
+    fused = layers.BatchNormalization()(fused)
+    attn = layers.Conv2D(out_channels, 1, activation='sigmoid', padding='same')(fused)
+    proj_x = layers.Conv2D(out_channels, 1, activation=None, padding='same')(x)
+    out = layers.Multiply()([proj_x, attn])
+    out = layers.Conv2D(K.int_shape(x)[-1] or tf.shape(x)[-1], 1, activation=None, padding='same')(out)
+    out = layers.Add()([x, out])
+    return out
+
+# ---------------- Cross-scale contextual discrepancy module (low-res) ----------------
+def cross_scale_contextual_discrepancy_module_lowres(x, channels=1024):
+    scales = [1,2,4]
+    feats = []
+    for r in scales:
+        f = layers.Conv2D(channels//8, 3, dilation_rate=r, padding='same', kernel_initializer='he_normal')(x)
+        f = layers.BatchNormalization()(f)
+        f = layers.ReLU()(f)
+        feats.append(f)
+    diffs = []
+    for i in range(len(feats)):
+        for j in range(i+1, len(feats)):
+            d = tf.abs(feats[i] - feats[j])
+            d = layers.Conv2D(channels//16, 1, activation='relu', padding='same')(d)
+            d = layers.BatchNormalization()(d)
+            diffs.append(d)
+    combined = layers.Concatenate()(diffs)
+    combined = layers.Conv2D(channels//2, 1, activation='relu', padding='same')(combined)
+    combined = layers.BatchNormalization()(combined)
+    attn = layers.Conv2D(channels, 1, activation='sigmoid', padding='same')(combined)
+    out = layers.Multiply()([x, attn])
+    out = layers.Add()([x, out])
+    return out
+
+# ---------------- Build model ----------------
+def build_deeplabv3_model_with_spectral(input_shape=(7,7,1024)):
+    inputs = layers.Input(shape=input_shape)
+    x = inputs
+    # ASPP-like
+    atrous_rates = [6,12,18]
+    aspp = []
+    for rate in atrous_rates:
+        a = layers.Conv2D(256, 3, dilation_rate=rate, padding='same')(x)
+        a = layers.BatchNormalization()(a)
+        a = layers.ReLU()(a)
+        aspp.append(a)
+    a1 = layers.Conv2D(256, 1, padding='same')(x)
+    a1 = layers.BatchNormalization()(a1)
+    a1 = layers.ReLU()(a1)
+    aspp.append(a1)
+    x = layers.Concatenate()(aspp)
+    # CSCDM low-res
+    x = cross_scale_contextual_discrepancy_module_lowres(x, channels=1024)
+    # decoder 7->28
+    x = layers.Conv2D(256, 1, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.UpSampling2D(size=(4,4), interpolation='bilinear')(x)  # 7->28
+    # spectral attention at 28
+    x = frequency_attention_block(x, out_channels=256, scales=(1,2))
+    # decoder 28->224
+    x = layers.Conv2D(128, 3, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    x = layers.UpSampling2D(size=(8,8), interpolation='bilinear')(x)  # 28->224
+    x = layers.Conv2D(64, 3, padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.ReLU()(x)
+    outputs = layers.Conv2D(1, 1, activation='sigmoid')(x)
+    model = Model(inputs, outputs, name='DeepLabV3_CSCDM_Spectral')
+    model.compile(optimizer='adam', loss=custom_loss, metrics=['accuracy'])
+    return model
+
+# ---------------- Testing + Visualization ----------------
+def run_test_all_in_one(model, test_feature_dir, test_image_dir, test_mask_dir, output_dir, batch_size=1):
+    os.makedirs(output_dir, exist_ok=True)
+    # find feature files
+    feats = [f for f in os.listdir(test_feature_dir) if f.endswith('_features.npy')]
+    feats.sort()
+    metrics_rows = []
+    missing_image = 0
+    missing_mask = 0
+    invalid_feat = 0
+    for f in feats:
+        base = f.replace('_features.npy', '')
+        feat_path = os.path.join(test_feature_dir, f)
+        # image candidate (look for common extensions)
+        img_path = None
+        for ext in ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp']:
+            cand = os.path.join(test_image_dir, base + ext)
+            if os.path.exists(cand):
+                img_path = cand
+                break
+        # mask candidate: prefer .npy mask in feature dir or mask_dir .png/.npy
+        mask_path = None
+        m_candidate1 = os.path.join(test_feature_dir, base + '_mask.npy')
+        if os.path.exists(m_candidate1):
+            mask_path = m_candidate1
+        else:
+            for ext in ['.npy', '.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp']:
+                cand = os.path.join(test_mask_dir, base + ('' if ext=='.npy' else ext))
+                # careful: if ext=='.npy' we want base + '.npy' or base + '_mask.npy' - check both
+                if ext == '.npy':
+                    cand2 = os.path.join(test_mask_dir, base + '_mask.npy')
+                    if os.path.exists(cand2):
+                        mask_path = cand2
+                        break
+                    cand3 = os.path.join(test_mask_dir, base + '.npy')
+                    if os.path.exists(cand3):
+                        mask_path = cand3
+                        break
+                else:
+                    cand_img = os.path.join(test_mask_dir, base + ext)
+                    cand_img2 = os.path.join(test_mask_dir, base + '_mask' + ext)
+                    if os.path.exists(cand_img):
+                        mask_path = cand_img; break
+                    if os.path.exists(cand_img2):
+                        mask_path = cand_img2; break
+        if mask_path is None:
+            print(f"[SKIP] Mask not found for {base}")
+            missing_mask += 1
+            continue
+        if img_path is None:
+            print(f"[SKIP] Image not found for {base}")
+            missing_image += 1
+            continue
+        # load feature
+        try:
+            feat = np.load(feat_path)
+        except Exception as e:
+            print(f"[SKIP] Cannot load feature: {feat_path} -> {e}")
+            invalid_feat += 1
+            continue
+        if feat.ndim == 4 and feat.shape[0] == 1:
+            feat = np.squeeze(feat, axis=0)
+        if feat.shape != (7,7,1024):
+            print(f"[SKIP] Invalid feature shape for {base}: {feat.shape}")
+            invalid_feat += 1
+            continue
+        # load mask
+        if mask_path.endswith('.npy'):
+            mask = np.load(mask_path)
+        else:
+            mask_img = plt.imread(mask_path)
+            if mask_img.ndim == 3:
+                mask_img = mask_img[:,:,0]
+            mask = np.expand_dims((mask_img > 127).astype(np.float32), axis=-1) if mask_img.max() > 1 else np.expand_dims(mask_img.astype(np.float32), axis=-1)
+        # ensure mask shape
+        if mask.shape != (224,224,1):
+            # try resize if not correct (nearest for mask)
+            try:
+                import cv2
+                mask_resized = cv2.resize(mask[:,:,0], (224,224), interpolation=cv2.INTER_NEAREST)
+                mask = np.expand_dims((mask_resized>0.5).astype(np.float32), axis=-1)
+            except Exception:
+                print(f"[SKIP] Mask shape invalid and cannot resize for {base}: {mask.shape}")
+                continue
+        # load image
+        img = plt.imread(img_path)
+        # predict (batch)
+        pred = model.predict(np.expand_dims(feat, axis=0), verbose=0)[0]
+        # ensure pred shape (224,224,1)
+        if pred.shape != (224,224,1):
+            pred = np.squeeze(pred)
+            pred = np.expand_dims(pred, axis=-1)
+        # metrics
+        m = compute_metrics_np(mask, pred)
+        m['Filename'] = base
+        metrics_rows.append(m)
+        # visualize: Image | GT | Pred
+        fig = plt.figure(figsize=(14,6))
+        ax1 = fig.add_subplot(1,3,1)
+        ax1.set_title('Image'); ax1.axis('off'); ax1.imshow(img)
+        ax2 = fig.add_subplot(1,3,2)
+        ax2.set_title('GT'); ax2.axis('off'); ax2.imshow(mask[:,:,0], cmap='gray')
+        ax3 = fig.add_subplot(1,3,3)
+        ax3.set_title('Pred'); ax3.axis('off'); ax3.imshow(pred[:,:,0] > 0.5, cmap='gray')
+        save_name = os.path.join(output_dir, base + '_viz.png')
+        plt.tight_layout(); plt.savefig(save_name); plt.close(fig)
+        print(f"[DONE] {base} -> saved {save_name}")
+    # finalize
+    if metrics_rows:
+        df = pd.DataFrame(metrics_rows)
+        df.to_excel(os.path.join(output_dir, 'test_metrics.xlsx'), index=False)
+        print("[SAVED] metrics:", os.path.join(output_dir, 'test_metrics.xlsx'))
+    print("SUMMARY: total_features:", len(feats), "missing_mask:", missing_mask, "missing_image:", missing_image, "invalid_feat:", invalid_feat)
+
+# ---------------- main CLI ----------------
+if __name__ == "__main__":
+    # ------ EDIT THESE PATHS ------
+    test_feature_dir = r"/GRIP_features/Feature"
+    test_image_dir   = r"/GRIP_features/images"
+    test_mask_dir    = r"/mask"
+    weights_path     = r"/deeplabv3_cscdm_spectral.weights.h5"
+    output_dir       = r"/GRIP"
+    # create output dir
+    os.makedirs(output_dir, exist_ok=True)
+    # build & load model
+    model = build_deeplabv3_model_with_spectral(input_shape=(7,7,1024))
+    if os.path.exists(weights_path):
+        model.load_weights(weights_path)
+        print("Loaded weights:", weights_path)
+    else:
+        print("WARNING: weights file not found, model has random weights.")
+    # run tests
+    run_test_all_in_one(model, test_feature_dir, test_image_dir, test_mask_dir, output_dir)
+    # cleanup
+    tf.keras.backend.clear_session()
+    gc.collect()
